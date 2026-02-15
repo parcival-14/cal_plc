@@ -25,6 +25,12 @@ using namespace qindesign::network;
 static AsyncWebServer server(constants::HTTP_PORT);
 static TeensyOtaUpdater ota(&server, constants::OTA_PATH);
 static volatile bool pendingUpdate = false;
+// Cached analog values (kept in sync with Serial prints)
+static volatile int cachedA14 = 0;
+static volatile int cachedA15 = 0;
+static volatile int cachedA16 = 0;
+// Timestamp (ms) of last periodic analog sample
+static volatile unsigned long lastAnalogSampleMillis = 0;
 
 // OTA callback
 static void onUpdateReady() {
@@ -45,23 +51,15 @@ static void handleRoot(AsyncWebServerRequest *request) {
     "<li><a href=\"/led/on\">/led/on</a></li>"
     "<li><a href=\"/led/off\">/led/off</a></li>"
     "</ul>"
-    "<p>Relay control:</p>"
-    "<ul>"
-    "<li><a href=\"/relay/1/on\">Relay 1 ON</a> | "
-    "<a href=\"/relay/1/off\">OFF</a></li>"
-    "<li><a href=\"/relay/2/on\">Relay 2 ON</a> | "
-    "<a href=\"/relay/2/off\">OFF</a></li>"
-    "<li><a href=\"/relay/3/on\">Relay 3 ON</a> | "
-    "<a href=\"/relay/3/off\">OFF</a></li>"
-    "<li><a href=\"/relay/4/on\">Relay 4 ON</a> | "
-    "<a href=\"/relay/4/off\">OFF</a></li>"
-    "</ul>"
+    
     "<p>Firmware updates:</p>"
     "<button onclick=\"location.href='/flasherx'\">FlasherX OTA</button> "
     "<button onclick=\"location.href='/teensy_ota'\">Teensy OTA</button>"
-    "<h3>Analog A0:</h3>"
-    "<div id=\"a0val\">--</div>"
-    "<script>function pollA0(){fetch('/analog').then(r=>r.text()).then(t=>document.getElementById('a0val').innerText=t);}setInterval(pollA0,1000);pollA0();</script>"
+      "<h3>Analog readings:</h3>"
+      "<div>A14: <span id=\"a14val\">--</span></div>"
+      "<div>A15: <span id=\"a15val\">--</span></div>"
+      "<div>A16: <span id=\"a16val\">--</span></div>"
+      "<script>function pollAnalogs(){fetch('/analog/14').then(r=>r.text()).then(t=>document.getElementById('a14val').innerText=t);fetch('/analog/15').then(r=>r.text()).then(t=>document.getElementById('a15val').innerText=t);fetch('/analog/16').then(r=>r.text()).then(t=>document.getElementById('a16val').innerText=t);}setInterval(pollAnalogs,5000);pollAnalogs();</script>"
     "</body></html>";
 
   request->send(200, "text/html", html);
@@ -201,11 +199,34 @@ static void handleFlasherXUpload(AsyncWebServerRequest *request, const String &f
   }
 }
 
-// Analog read endpoint for A0
-static void handleAnalog(AsyncWebServerRequest *request) {
-  int val = analogRead(A0);
-  String s = String(val);
-  request->send(200, "text/plain", s);
+
+
+// Analog read endpoints for A14, A15, A16
+// Generic analog handler helper (matches style of LED/relay helpers)
+static void handleAnalogGeneric(AsyncWebServerRequest *request, int analogNum) {
+  int val = 0;
+  switch (analogNum) {
+    case 14: val = cachedA14; break;
+    case 15: val = cachedA15; break;
+    case 16: val = cachedA16; break;
+    default: val = 0; break;
+  }
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%d", val);
+  request->send(200, "text/plain", buf);
+}
+
+static void handleAnalog14(AsyncWebServerRequest *r) { handleAnalogGeneric(r, 14); }
+static void handleAnalog15(AsyncWebServerRequest *r) { handleAnalogGeneric(r, 15); }
+static void handleAnalog16(AsyncWebServerRequest *r) { handleAnalogGeneric(r, 16); }
+
+// Get relay status as JSON
+static void handleRelayStatus(AsyncWebServerRequest *request) {
+  char json[64];
+  snprintf(json, sizeof(json), "{\"relay1\":%s,\"relay2\":%s}",
+           hw_getRelay(1) ? "true" : "false",
+           hw_getRelay(2) ? "true" : "false");
+  request->send(200, "application/json", json);
 }
 
 // -----------------------------------------------------------------------------
@@ -249,7 +270,14 @@ void networking_init() {
   server.on("/flasherx", HTTP_GET, handleFlasherXPage);
   server.on("/teensy_ota", HTTP_GET, handleTeensyOtaPage);
   server.on("/update", HTTP_GET, handleTeensyOtaPage);
-  server.on("/analog", HTTP_GET, handleAnalog);
+  
+  server.on("/analog/14", HTTP_GET, handleAnalog14);
+  server.on("/analog/15", HTTP_GET, handleAnalog15);
+  server.on("/analog/16", HTTP_GET, handleAnalog16);
+  
+
+  
+  server.on("/relay/status", HTTP_GET, handleRelayStatus);
   server.on("/flasherx/upload", HTTP_POST,
             [](AsyncWebServerRequest *request){
               const char resp[] = "<!DOCTYPE html><html><body><h1>Upload received</h1><p><a href='/'>Return to control panel</a></p></body></html>";
@@ -280,6 +308,17 @@ void networking_init() {
 }
 
 void networking_loop() {
+  if (millis() - lastAnalogSampleMillis >= ANALOG_POLL_INTERVAL_MS) {
+    lastAnalogSampleMillis = millis();
+    int a14 = analogRead(ANALOG_PIN_14);
+    int a15 = analogRead(ANALOG_PIN_15);
+    int a16 = analogRead(ANALOG_PIN_16);
+    cachedA14 = a14;
+    cachedA15 = a15;
+    cachedA16 = a16;
+    
+  }
+
   if (pendingUpdate) {
     pendingUpdate = false;
     Serial.println("Applying update now (networking)");

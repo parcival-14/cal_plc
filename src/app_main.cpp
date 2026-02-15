@@ -15,6 +15,9 @@ static unsigned long blinkInterval = DEFAULT_BLINK_INTERVAL;
 static bool blinkEnabled = true;
 static bool ledState     = false;
 
+// Relay state tracking
+static bool relayState[5] = {false, false, false, false, false};  // index 0 unused, 1-4 for relays
+
 void hw_init() {
   pinMode(LED_PIN, OUTPUT);
   pinMode(RELAY1_PIN, OUTPUT);
@@ -76,7 +79,13 @@ void hw_setRelay(int relay, bool on) {
     case 4: pin = RELAY4_PIN; break;
     default: return;
   }
+  relayState[relay] = on;
   digitalWrite(pin, on ? HIGH : LOW);
+}
+
+bool hw_getRelay(int relay) {
+  if (relay < 1 || relay > 4) return false;
+  return relayState[relay];
 }
 
 // Entry points for Arduino runtime
