@@ -99,6 +99,7 @@ static constexpr unsigned long MAX22530_CLEAR_FILTERS_WAIT_MS = 2UL;
 static constexpr unsigned long MAX22530_CLEAR_POR_WAIT_MS = 2UL;
 static constexpr unsigned long MAX22530_SOFT_RESET_WAIT_MS = 10UL;
 static constexpr unsigned long MAX22530_HARD_RESET_WAIT_MS = 20UL;
+static constexpr unsigned long SPI_REINIT_ON_ZERO_DROP_COOLDOWN_MS = 5000UL;
 enum class AdcWorkflow : uint8_t {
   Idle,
   Init,
@@ -121,6 +122,9 @@ static unsigned long adcWorkflowReadyAtMillis = 0;
 static const char *adcWorkflowReason = nullptr;
 static bool spiBusEnabled = true;
 static SpiControlAction pendingSpiControlAction = SpiControlAction::None;
+static uint16_t lastA13RawReading = 0;
+static bool hasLastA13RawReading = false;
+static volatile unsigned long lastZeroDropSpiReinitMillis = 0;
 static volatile uint32_t httpResponsesSent = 0;
 static volatile uint32_t adcStatusRequests = 0;
 static volatile uint32_t adcNotReadyResponses = 0;
@@ -212,6 +216,17 @@ static float loopCurrentToTempC(float currentMa) {
   const float clampedCurrent = std::max(LOOP_CURRENT_MIN_MA, std::min(currentMa, LOOP_CURRENT_MAX_MA));
   const float normalized = (clampedCurrent - LOOP_CURRENT_MIN_MA) / (LOOP_CURRENT_MAX_MA - LOOP_CURRENT_MIN_MA);
   return LOOP_TEMP_MIN_C + normalized * (LOOP_TEMP_MAX_C - LOOP_TEMP_MIN_C);
+}
+
+static bool localAnalogNominalForZeroDropReset(int a14Counts) {
+  const float voltsA14 = teensyAdcCountsToVolts(a14Counts);
+  const float currentMaA14 = voltsToMilliamps(voltsA14, A14_SHUNT_RESISTOR_OHMS);
+  return currentMaA14 >= LOOP_CURRENT_MIN_MA && currentMaA14 <= LOOP_CURRENT_MAX_MA;
+}
+
+static bool interruptStatusNominalForZeroDropReset(uint16_t interruptStatus) {
+  const uint16_t faultMask = static_cast<uint16_t>(INT_STATUS_SPICRC | INT_STATUS_SPIFRM | INT_STATUS_FLD | INT_STATUS_ADCF);
+  return (interruptStatus & faultMask) == 0u;
 }
 
 static int computeMedian(const int *samples, int sampleCount) {
@@ -507,6 +522,8 @@ static void beginMax22530Init() {
   SPI.begin();
   Serial.printf("ADC SPI configured: CS=%d, ADC1_ADDR=0x%02X\n", ADC_CS_PIN, REG_ADC1);
   adcReady = false;
+  hasLastA13RawReading = false;
+  lastA13RawReading = 0;
   setAdcWorkflow(AdcWorkflow::Init, 0, ADC_INIT_STABILIZE_MS, "startup");
 }
 
@@ -717,6 +734,8 @@ static void processPendingSpiControlAction() {
     digitalWrite(ADC_CS_PIN, HIGH);
     SPI.end();
     spiBusEnabled = false;
+    hasLastA13RawReading = false;
+    lastA13RawReading = 0;
     Serial.println("SPI control: SPI.end() executed (manual stop). Ethernet may be unavailable until SPI is started.");
     return;
   }
@@ -739,6 +758,8 @@ static void processPendingSpiControlAction() {
     SPI.end();
     SPI.begin();
     spiBusEnabled = true;
+    hasLastA13RawReading = false;
+    lastA13RawReading = 0;
     beginMax22530Init();
     restartNetworkingService("Manual SPI reinit");
     Serial.println("SPI control: SPI bus reinitialized (manual reinit).");
@@ -1316,6 +1337,27 @@ void networking_loop() {
     const int a14 = analogRead(ANALOG_PIN_14);
     if (adcReady && !adcFieldPowerDisabled) {
       a13 = static_cast<int>(readAdc1());
+
+      const uint16_t rawA13 = static_cast<uint16_t>(a13 & 0x0FFF);
+      const bool zeroDrop = hasLastA13RawReading && lastA13RawReading > 0u && rawA13 == 0u;
+      const bool nominalNow = cachedAdcFresh &&
+                              spiBusEnabled &&
+                              interruptStatusNominalForZeroDropReset(cachedInterruptStatus) &&
+                              localAnalogNominalForZeroDropReset(a14);
+      const bool reinitCooldownElapsed = (now - lastZeroDropSpiReinitMillis) >= SPI_REINIT_ON_ZERO_DROP_COOLDOWN_MS;
+
+      if (zeroDrop && nominalNow && reinitCooldownElapsed) {
+        Serial.printf("ADC zero-drop detected (prev=%u, now=%u, int_status=0x%04X). Queuing SPI reinit.\n",
+                      lastA13RawReading,
+                      rawA13,
+                      cachedInterruptStatus);
+        queueSpiControlAction(SpiControlAction::Reinit);
+        lastZeroDropSpiReinitMillis = now;
+      }
+
+      lastA13RawReading = rawA13;
+      hasLastA13RawReading = true;
+
       if (isStuck(static_cast<uint16_t>(a13))) {
         if (stuckCount < 0xFFFFu) {
           stuckCount++;
