@@ -28,6 +28,10 @@ using namespace qindesign::network;
 static AsyncWebServer server(constants::HTTP_PORT);
 static TeensyOtaUpdater ota(&server, constants::OTA_PATH);
 static volatile bool pendingUpdate = false;
+static volatile bool pendingReboot = false;
+
+static constexpr unsigned long PERIODIC_REBOOT_MS = 60000UL; // 1 minute
+static unsigned long periodicRebootStartMillis = 0;
 static bool routesRegistered = false;
 static bool serverStarted = false;
 static bool defaultHeadersConfigured = false;
@@ -846,6 +850,9 @@ static void handleRoot(AsyncWebServerRequest *request) {
       "<div id=\"adcctl\">Idle</div>"
       "<div>ADC status: <a href=\"/adc/status\">/adc/status</a></div>"
       "<div>HTTP diagnostics: <a href=\"/diag/http\">/diag/http</a></div>"
+      "<hr>"
+      "<h3>System:</h3>"
+      "<button style=\"background:#c0392b;color:#fff;\" onclick=\"triggerAdcAction('/system/reboot','Hard restart the Teensy now?')\">Restart Teensy</button> "
       "<script>let adcPollBusy=false;async function pollAdc(){if(adcPollBusy)return;adcPollBusy=true;const ctl=new AbortController();const t=setTimeout(()=>ctl.abort(),1500);try{const r=await fetch('/adc/status?ts='+Date.now(),{cache:'no-store',keepalive:false,signal:ctl.signal});const s=await r.json();document.getElementById('a13raw').innerText=String(Number(s.raw)||0);document.getElementById('a13v').innerText=(Number(s.volts)||0).toFixed(6);document.getElementById('a13ma').innerText=(Number(s.current_ma)||0).toFixed(5);document.getElementById('a13state').innerText=s.field_power_disabled?'disabled by DISPWR':(s.isolated_adc_active?'active':'inactive');document.getElementById('a13heal').innerText=s.auto_recovery_enabled?'enabled':'paused';document.getElementById('a14raw').innerText=String(Number(s.raw_a14)||0);document.getElementById('a14v').innerText=(Number(s.volts_a14)||0).toFixed(6);document.getElementById('a14ma').innerText=(Number(s.current_ma_a14)||0).toFixed(5);document.getElementById('a14c').innerText=(Number(s.temp_c_a14)||0).toFixed(2);document.getElementById('a14state').innerText=s.local_analog_active?'active':'inactive';document.getElementById('spibus').innerText=s.spi_bus_enabled?(s.spi_action_pending&&s.spi_action_pending!=='none'?'enabled (pending '+s.spi_action_pending+')':'enabled'):(s.spi_action_pending&&s.spi_action_pending!=='none'?'disabled (pending '+s.spi_action_pending+')':'disabled');}catch(_e){}finally{clearTimeout(t);adcPollBusy=false;}}async function triggerAdcAction(path,msg){if(msg&&!confirm(msg))return;const out=document.getElementById('adcctl');out.innerText='Sending '+path+'...';try{const r=await fetch(path,{method:'POST',cache:'no-store'});const t=await r.text();out.innerText=t;}catch(e){out.innerText='Request failed';}}setInterval(pollAdc,1000);pollAdc();</script>"
     "</body></html>";
 
@@ -872,6 +879,14 @@ static void handleTeensyOtaPage(AsyncWebServerRequest *request) {
     "</body></html>";
 
   sendNoKeepAlive(request, 200, "text/html", html);
+}
+
+static void handleReboot(AsyncWebServerRequest *request) {
+  if (rejectIfHttpOverloaded(request)) {
+    return;
+  }
+  sendNoKeepAlive(request, 200, "application/json", "{\"rebooting\":true}");
+  pendingReboot = true;
 }
 
 static void handleNotFound(AsyncWebServerRequest *request) {
@@ -1078,6 +1093,13 @@ static void handleAdcStatus(AsyncWebServerRequest *request) {
   json += String(LOOP_TEMP_MIN_C, 1);
   json += ",\"temp_scale_max_c\":";
   json += String(LOOP_TEMP_MAX_C, 1);
+  {
+    const unsigned long nowStatus = millis();
+    const unsigned long elapsed = nowStatus - periodicRebootStartMillis;
+    const unsigned long remaining = (periodicRebootStartMillis == 0 || elapsed >= PERIODIC_REBOOT_MS) ? 0UL : (PERIODIC_REBOOT_MS - elapsed);
+    json += ",\"periodic_reboot_ms_remaining\":";
+    json += remaining;
+  }
   json += '}';
   sendNoKeepAlive(request, 200, "application/json", json.c_str());
 }
@@ -1295,6 +1317,7 @@ void networking_init() {
     server.on("/spi/start", HTTP_POST, handleSpiStart);
     server.on("/spi/reinit", HTTP_POST, handleSpiReinit);
     server.on("/diag/http", HTTP_GET, handleHttpDiag);
+    server.on("/system/reboot", HTTP_POST, handleReboot);
 
     server.on("/flasherx/upload", HTTP_POST,
               [](AsyncWebServerRequest *request){
@@ -1419,6 +1442,24 @@ void networking_loop() {
     pendingUpdate = false;
     Serial.println("Applying update now (networking)");
     ota.applyUpdate();
+  }
+
+  if (periodicRebootStartMillis == 0) {
+    periodicRebootStartMillis = now;
+  }
+
+  if (now - periodicRebootStartMillis >= PERIODIC_REBOOT_MS) {
+    Serial.println("Periodic 5-minute reboot.");
+    Serial.flush();
+    SCB_AIRCR = 0x05FA0004;
+    while (true) { /* wait for reset */ }
+  }
+
+  if (pendingReboot) {
+    Serial.println("Rebooting Teensy on request.");
+    Serial.flush();
+    SCB_AIRCR = 0x05FA0004;
+    while (true) { /* wait for reset */ }
   }
 
   if (now - lastHttpDiagPrintMillis >= HTTP_DIAG_PRINT_INTERVAL_MS) {
